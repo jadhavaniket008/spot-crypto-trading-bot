@@ -12,7 +12,9 @@ from dotenv import load_dotenv
 from telegram import Bot
 from typing import Dict, List, Tuple
 import asyncio
-
+import urllib3
+from urllib.parse import urlparse, urlencode
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +34,7 @@ COINSWITCH_API_KEY = os.getenv('COINSWITCH_API_KEY')
 COINSWITCH_API_SECRET = os.getenv('COINSWITCH_API_SECRET')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-BASE_URL = "https://coinswitch.co/trade/api/v2"
+BASE_URL = "https://coinswitch.co"
 WALLET_UTILIZATION = 0.9  # 90% of wallet balance
 TIMEFRAME = '1440'  # Daily candles in minutes
 
@@ -47,22 +49,32 @@ class CoinSwitchAPI:
         """Generate Ed25519 signature for API authentication."""
         try:
             epoch_time = str(int(time.time() * 1000))  # Current time in milliseconds
-            unquote_endpoint = endpoint
-            if method == "GET" and params:
-                endpoint += ('&', '?')[urllib.parse.urlparse(endpoint).query == ''] + urllib.parse.urlencode(params)
-                unquote_endpoint = urllib.parse.unquote_plus(endpoint)
-            
-            signature_msg = method + unquote_endpoint
-            if payload:
-                signature_msg += json.dumps(payload, separators=(',', ':'), sort_keys=True)
-            else:
-                signature_msg += epoch_time
+            original_endpoint = endpoint
 
-            request_string = bytes(signature_msg, 'utf-8')
+            if method == "GET" and params:
+                endpoint += ('&', '?')[urllib.parse.urlparse(endpoint).query == ''] + urlencode(params)
+                original_endpoint = urllib.parse.unquote_plus(endpoint)
+
+            # For /validate/keys, ensure payload is always {}
+            if original_endpoint == "/validate/keys" and payload is None:
+                payload = {}
+
+            # Ensure payload is not None
+            if payload is None:
+                payload = {}
+
+            # Construct signature message
+            message = method + original_endpoint + json.dumps(payload, separators=(',', ':'), sort_keys=True)
+            request_bytes = message.encode('utf-8')
+
             secret_key_bytes = bytes.fromhex(self.api_secret)
             secret_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
-            signature_bytes = secret_key.sign(request_string)
+            signature_bytes = secret_key.sign(request_bytes)
             signature = signature_bytes.hex()
+
+            logger.debug(f"Signature message: {message}")
+            logger.debug(f"Generated signature: {signature}")
+
             return signature, epoch_time
         except Exception as e:
             logger.error(f"Error generating signature: {str(e)}")
@@ -71,16 +83,16 @@ class CoinSwitchAPI:
     def validate_keys(self) -> bool:
         """Validate API key and secret."""
         try:
-            endpoint = "/validate/keys"
+            endpoint = "/trade/api/v2/validate/keys"
             signature, epoch_time = self._generate_signature('GET', endpoint, params={})
             headers = {
                 'X-AUTH-APIKEY': self.api_key,
                 'X-AUTH-SIGNATURE': signature,
-                'X-AUTH-EPOCH': epoch_time,
                 'Content-Type': 'application/json'
             }
-            response = requests.get(BASE_URL + endpoint, headers=headers, json={})
-            logger.info(f"Key validation response: {response.text}")
+            logger.info(f"Validating keys with endpoint: {BASE_URL + endpoint}, headers: {headers}")
+            response = requests.get(BASE_URL + endpoint, headers=headers, json={},verify=False)
+            logger.info(f"Key validation response: Status {response.status_code}, Content: {response.text}")
             response.raise_for_status()
             data = response.json()
             return data.get("message") == "Valid Access"
@@ -386,15 +398,17 @@ class TradingBot:
                 await self.send_telegram_message(f"Bot Error: {str(e)}")
                 time.sleep(3600)
 
+
 async def main():
-    """Initialize and run the trading bot."""
     api = CoinSwitchAPI(COINSWITCH_API_KEY, COINSWITCH_API_SECRET)
     bot = TradingBot(api, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    
     if not api.validate_keys():
-        logger.error("Invalid API key or secret. Exiting.")
-        await bot.send_telegram_message("Error: Invalid API key or secret")
+        logger.error("Error: Invalid API keys")
+        await bot.send_telegram_message("Error: Invalid API keys")
         return
+    
     await bot.run()
 
-if __name__ in ["__main__", "pyodide"]:
+if __name__ == "__main__":
     asyncio.run(main())
