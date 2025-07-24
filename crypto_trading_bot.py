@@ -45,40 +45,38 @@ class CoinSwitchAPI:
         self.api_key = api_key
         self.api_secret = api_secret
 
-    def _generate_signature(self, method: str, endpoint: str, params: dict = None, payload: dict = None) -> tuple:
+    def _generate_signature(self, method: str, endpoint: str, params: dict = None, payload: dict = None) -> Tuple[str, str]:
         """Generate Ed25519 signature for API authentication."""
         try:
-            epoch_time = str(int(time.time() * 1000))  # Current time in milliseconds
-            original_endpoint = endpoint
+            epoch_time = str(int(time.time() * 1000))
+            params = params or {}
+            payload = payload or {}
 
-            if method == "GET" and params:
-                endpoint += ('&', '?')[urllib.parse.urlparse(endpoint).query == ''] + urlencode(params)
-                original_endpoint = urllib.parse.unquote_plus(endpoint)
+            # Prepare final endpoint with query string
+            final_endpoint = endpoint
+            if method.upper() == "GET" and params:
+                final_endpoint += ('&', '?')[urlparse(endpoint).query == ''] + urlencode(params)
 
-            # For /validate/keys, ensure payload is always {}
-            if original_endpoint == "/validate/keys" and payload is None:
-                payload = {}
+            unquoted_endpoint = urllib.parse.unquote_plus(final_endpoint)
 
-            # Ensure payload is not None
-            if payload is None:
-                payload = {}
+            # Decide how to construct signature message
+            if method.upper() == "GET":
+                signature_msg = method + unquoted_endpoint + epoch_time
+            else:
+                signature_msg = method + unquoted_endpoint + json.dumps(payload, separators=(',', ':'), sort_keys=True)
 
-            # Construct signature message
-            message = method + original_endpoint + json.dumps(payload, separators=(',', ':'), sort_keys=True)
-            request_bytes = message.encode('utf-8')
-
+            request_bytes = signature_msg.encode('utf-8')
             secret_key_bytes = bytes.fromhex(self.api_secret)
             secret_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
             signature_bytes = secret_key.sign(request_bytes)
             signature = signature_bytes.hex()
 
-            logger.debug(f"Signature message: {message}")
-            logger.debug(f"Generated signature: {signature}")
-
             return signature, epoch_time
+
         except Exception as e:
             logger.error(f"Error generating signature: {str(e)}")
             raise
+
 
     def validate_keys(self) -> bool:
         """Validate API key and secret."""
@@ -88,10 +86,11 @@ class CoinSwitchAPI:
             headers = {
                 'X-AUTH-APIKEY': self.api_key,
                 'X-AUTH-SIGNATURE': signature,
+                'X-AUTH-EPOCH': epoch_time,  # <- FIXED
                 'Content-Type': 'application/json'
             }
             logger.info(f"Validating keys with endpoint: {BASE_URL + endpoint}, headers: {headers}")
-            response = requests.get(BASE_URL + endpoint, headers=headers, json={},verify=False)
+            response = requests.get(BASE_URL + endpoint, headers=headers, json={}, verify=False)
             logger.info(f"Key validation response: Status {response.status_code}, Content: {response.text}")
             response.raise_for_status()
             data = response.json()
@@ -100,11 +99,12 @@ class CoinSwitchAPI:
             logger.error(f"Error validating keys: {str(e)}")
             return False
 
+
     def get_available_symbols(self) -> List[str]:
         """Fetch available trading pairs."""
         try:
-            endpoint = "/coins"
-            params = {"exchange": "coinswitchx"}  # Default to coinswitchx
+            endpoint = "/trade/api/v2/coins"
+            params = {"exchange": "coinswitchx"}  # Use "coinswitchx" for CoinSwitch exchange
             signature, epoch_time = self._generate_signature('GET', endpoint, params=params)
             headers = {
                 'X-AUTH-APIKEY': self.api_key,
@@ -116,44 +116,78 @@ class CoinSwitchAPI:
             response = requests.get(BASE_URL + endpoint, headers=headers, params=params)
             logger.info(f"Response status: {response.status_code}, content: {response.text}")
             response.raise_for_status()
-            pairs = response.json()['data']['coinswitchx']
-            return [pair for pair in pairs if pair.endswith('/INR')]
+            data = response.json()
+            if 'data' in data and data['data'].get('coinswitchx'):  # Check for coinswitchx key
+                pairs = data['data']['coinswitchx']
+                return [pair for pair in pairs if pair.endswith('/INR')]  # Filter for INR pairs
+            else:
+                logger.warning("No valid symbols found for coinswitchx")
+                return []
         except Exception as e:
             logger.error(f"Error fetching available symbols: {str(e)}")
             return []
 
     def get_market_data(self, symbol: str) -> pd.DataFrame:
-        """Fetch historical OHLCV data for a given symbol."""
         try:
-            endpoint = "/candles"
-            end_time = int(time.time() * 1000)  # Current time in milliseconds
-            start_time = end_time - (100 * 24 * 60 * 60 * 1000)  # 100 days ago
+            endpoint = "/trade/api/v2/candles"
+            current_time = int(time.time() * 1000)
+            start_time = current_time - (100 * 24 * 60 * 60 * 1000)  # 100 days data
             params = {
+                "start_time": start_time,
+                "end_time": current_time,
                 "symbol": symbol,
-                "exchange": "coinswitchx",
                 "interval": TIMEFRAME,
-                "start_time": str(start_time),
-                "end_time": str(end_time)
+                "exchange": "coinswitchx"
             }
-            signature, epoch_time = self._generate_signature('GET', endpoint, params=params)
+
+            signature, epoch_time = self._generate_signature(
+                method="GET",
+                endpoint=endpoint,
+                params=params,
+                payload=None  # No payload for GET
+            )
+
+            full_url = f"{BASE_URL}{endpoint}"
             headers = {
                 'X-AUTH-APIKEY': self.api_key,
                 'X-AUTH-SIGNATURE': signature,
                 'X-AUTH-EPOCH': epoch_time,
                 'Content-Type': 'application/json'
             }
-            response = requests.get(BASE_URL + endpoint, headers=headers, params=params)
-            logger.info(f"Response status: {response.status_code}, content: {response.text}")
+
+            logger.info(f"Fetching market data from: {full_url} with headers: {headers}")
+
+            response = requests.get(full_url, headers=headers, params=params, verify=False)
             response.raise_for_status()
-            data = response.json()['result']
-            df = pd.DataFrame(data, columns=['start_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'symbol', 'interval'])
-            df['timestamp'] = pd.to_datetime(df['start_time'], unit='ms')
-            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
-            return df
+            #print("This is the response\n", response.json())
+            data = response.json().get('data', [])  # Changed from 'result' to 'data'
+            if not data:
+                logger.warning(f"No data returned for {symbol}")
+                return pd.DataFrame()
+
+            df = pd.DataFrame(data)
+            column_map = {
+                'o': 'open',
+                'h': 'high',
+                'l': 'low',
+                'c': 'close',
+                'v': 'volume',
+                'start_time': 'timestamp'
+            }
+            df = df.rename(columns=column_map)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric)
+
+            return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+
         except Exception as e:
             logger.error(f"Error fetching market data for {symbol}: {str(e)}")
+            if hasattr(e, 'response'):
+                logger.error(f"Response status: {e.response.status_code}")
+                logger.error(f"Response content: {e.response.text[:500]}")
             return None
+
 
     def get_wallet_balance(self) -> float:
         """Fetch INR wallet balance."""
@@ -168,6 +202,7 @@ class CoinSwitchAPI:
             }
             response = requests.get(BASE_URL + endpoint, headers=headers, json={})
             logger.info(f"Response status: {response.status_code}, content: {response.text}")
+            
             response.raise_for_status()
             balances = response.json()['data']
             for balance in balances:
@@ -225,6 +260,7 @@ class CoinSwitchAPI:
             logger.info(f"Response status: {response.status_code}, content: {response.text}")
             response.raise_for_status()
             logger.info(f"Placed {side} order for {symbol}: {amount} at price {price}")
+            
             return True
         except Exception as e:
             logger.error(f"Error placing {side} order for {symbol}: {str(e)}")
@@ -329,6 +365,7 @@ class TradingBot:
         while True:
             try:
                 logger.info("Starting market scan...")
+                
                 symbols = self.api.get_available_symbols()
                 if not symbols:
                     await self.send_telegram_message("Error: No symbols available")
@@ -356,6 +393,7 @@ class TradingBot:
 
                 if not signals:
                     logger.info("No trading signals found")
+                    
                     time.sleep(3600)
                     continue
 
@@ -407,8 +445,12 @@ async def main():
         logger.error("Error: Invalid API keys")
         await bot.send_telegram_message("Error: Invalid API keys")
         return
-    
+    # data = api.get_market_data("BTC/INR")
+    # print(data)
     await bot.run()
+
+    #data = api.get_market_data("ETH/INR")
+    #print(data)
 
 if __name__ == "__main__":
     asyncio.run(main())
