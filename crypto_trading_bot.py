@@ -38,6 +38,13 @@ BASE_URL = "https://coinswitch.co"
 WALLET_UTILIZATION = 0.9  # 90% of wallet balance
 TIMEFRAME = '1440'  # Daily candles in minutes
 
+class HealthCheckHandler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
 class CoinSwitchAPI:
     """Handles interactions with CoinSwitch API."""
     
@@ -438,6 +445,16 @@ class TradingBot:
 
 
 async def main():
+    port = int(os.getenv("PORT", 10000))
+    # Start a simple HTTP server for health checks
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"Listening on port {port} for Render health check")
+
+    # Run the server in a separate thread or async task if needed
+    import threading
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
     api = CoinSwitchAPI(COINSWITCH_API_KEY, COINSWITCH_API_SECRET)
     bot = TradingBot(api, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
     
