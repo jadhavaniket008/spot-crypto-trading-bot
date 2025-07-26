@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: crypto-trading-bot
+    env: python
+    region: oregon  # Updated to Oregon, USA
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python crypto_trading_bot.py"
